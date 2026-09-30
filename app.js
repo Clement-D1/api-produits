@@ -1,13 +1,26 @@
 const express = require('express');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
 
 const app = express();
 const PORT = 3000;
 
-// Parse automatiquement les corps de requête JSON
+// Clé secrète servant à signer les jetons.
+// En production, elle doit venir d'une variable d'environnement, jamais du code.
+const JWT_SECRET = process.env.JWT_SECRET || 'change-moi-cle-secrete-de-dev';
+const JWT_EXPIRATION = '5m';
+
 app.use(express.json());
 
 // ---------------------------------------------------------------------------
-// Données en mémoire (remises à zéro à chaque redémarrage du serveur)
+// Utilisateurs (en mémoire). Les mots de passe sont stockés hachés, jamais en clair.
+// ---------------------------------------------------------------------------
+const utilisateurs = [
+  { id: 1, identifiant: 'admin', motDePasseHache: bcrypt.hashSync('admin123', 10) },
+];
+
+// ---------------------------------------------------------------------------
+// Produits (en mémoire, remis à zéro à chaque redémarrage)
 // ---------------------------------------------------------------------------
 let produits = [
   { id: 1, nom: 'Clavier mécanique', description: 'Clavier AZERTY, switches rouges', prix: 89.99, categorie: 'Informatique' },
@@ -18,7 +31,7 @@ let prochainId = 3;
 const CHAMPS = ['nom', 'description', 'prix', 'categorie'];
 
 // ---------------------------------------------------------------------------
-// Validation
+// Validation des produits
 // partiel = false -> tous les champs obligatoires (POST, PUT)
 // partiel = true  -> seuls les champs envoyés sont vérifiés (PATCH)
 // ---------------------------------------------------------------------------
@@ -72,7 +85,65 @@ function trouverProduit(req, res, next) {
 }
 
 // ---------------------------------------------------------------------------
-// Routes
+// Middleware d'authentification
+// Attend l'en-tête : Authorization: Bearer <jeton>
+// ---------------------------------------------------------------------------
+function authentifier(req, res, next) {
+  const entete = req.headers.authorization || '';
+  const [type, jeton] = entete.split(' ');
+
+  if (type !== 'Bearer' || !jeton) {
+    res.set('WWW-Authenticate', 'Bearer');
+    return res.status(401).json({ erreur: 'Jeton d\'accès manquant' });
+  }
+
+  try {
+    const contenu = jwt.verify(jeton, JWT_SECRET, { algorithms: ['HS256'] });
+    req.utilisateur = { id: contenu.sub, identifiant: contenu.identifiant };
+    next();
+  } catch (err) {
+    res.set('WWW-Authenticate', 'Bearer error="invalid_token"');
+    if (err.name === 'TokenExpiredError') {
+      return res.status(401).json({ erreur: 'Jeton expiré, reconnectez-vous' });
+    }
+    return res.status(401).json({ erreur: 'Jeton invalide' });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Authentification : génère un jeton valable 5 minutes
+// ---------------------------------------------------------------------------
+app.post('/auth/login', (req, res) => {
+  const { identifiant, motDePasse } = req.body || {};
+
+  if (typeof identifiant !== 'string' || typeof motDePasse !== 'string' || !identifiant || !motDePasse) {
+    return res.status(400).json({ erreur: 'Les champs "identifiant" et "motDePasse" sont obligatoires' });
+  }
+
+  const utilisateur = utilisateurs.find((u) => u.identifiant === identifiant);
+
+  // Même message que l'identifiant ou le mot de passe soit faux :
+  // on ne révèle pas quels comptes existent.
+  if (!utilisateur || !bcrypt.compareSync(motDePasse, utilisateur.motDePasseHache)) {
+    return res.status(401).json({ erreur: 'Identifiant ou mot de passe incorrect' });
+  }
+
+  const jeton = jwt.sign(
+    { sub: utilisateur.id, identifiant: utilisateur.identifiant },
+    JWT_SECRET,
+    { expiresIn: JWT_EXPIRATION, algorithm: 'HS256' }
+  );
+
+  res.status(200).json({
+    jeton,
+    type: 'Bearer',
+    expireDans: 300, // secondes
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Routes produits
+// Lecture : publique. Écriture : protégée par authentifier.
 // ---------------------------------------------------------------------------
 
 // Lister (filtre optionnel : /produits?categorie=Sport)
@@ -90,8 +161,8 @@ app.get('/produits/:id', trouverProduit, (req, res) => {
   res.status(200).json(produits[req.indexProduit]);
 });
 
-// Ajouter
-app.post('/produits', (req, res) => {
+// Ajouter (protégé)
+app.post('/produits', authentifier, (req, res) => {
   const erreurs = valider(req.body);
   if (erreurs.length > 0) {
     return res.status(400).json({ erreurs });
@@ -104,8 +175,8 @@ app.post('/produits', (req, res) => {
   res.status(201).location(`/produits/${produit.id}`).json(produit);
 });
 
-// Remplacer (PUT = remplacement complet, tous les champs obligatoires)
-app.put('/produits/:id', trouverProduit, (req, res) => {
+// Remplacer (protégé) : tous les champs obligatoires
+app.put('/produits/:id', authentifier, trouverProduit, (req, res) => {
   const erreurs = valider(req.body);
   if (erreurs.length > 0) {
     return res.status(400).json({ erreurs });
@@ -118,8 +189,8 @@ app.put('/produits/:id', trouverProduit, (req, res) => {
   res.status(200).json(produits[req.indexProduit]);
 });
 
-// Modifier (PATCH = modification partielle, seuls les champs envoyés changent)
-app.patch('/produits/:id', trouverProduit, (req, res) => {
+// Modifier (protégé) : seuls les champs envoyés changent
+app.patch('/produits/:id', authentifier, trouverProduit, (req, res) => {
   const erreurs = valider(req.body, true);
   if (erreurs.length > 0) {
     return res.status(400).json({ erreurs });
@@ -130,8 +201,8 @@ app.patch('/produits/:id', trouverProduit, (req, res) => {
   res.status(200).json(produits[req.indexProduit]);
 });
 
-// Supprimer
-app.delete('/produits/:id', trouverProduit, (req, res) => {
+// Supprimer (protégé)
+app.delete('/produits/:id', authentifier, trouverProduit, (req, res) => {
   produits.splice(req.indexProduit, 1);
   res.status(204).end();
 });
@@ -155,5 +226,5 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`API démarrée sur http://localhost:${PORT}/produits`);
+  console.log(`API démarrée sur http://localhost:${PORT}`);
 });
